@@ -34,7 +34,15 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 
+#if defined(__aarch64__) and !defined(__NR_poll)
+# define __NR_poll 0x49
+#endif
+
 #include "test_harness.h"
+
+#ifndef NT_ARM_SYSTEM_CALL
+# define NT_ARM_SYSTEM_CALL     0x404
+#endif
 
 #ifndef PR_SET_PTRACER
 # define PR_SET_PTRACER 0x59616d61
@@ -1074,15 +1082,32 @@ TEST_F(TRACE_poke, getpid_runs_normally) {
 int get_syscall(struct __test_metadata *_metadata, pid_t tracee) {
 	struct iovec iov;
 	ARCH_REGS regs;
+	int scno;
+
+#if defined(__aarch64__)
+	iov.iov_base = &scno;
+	iov.iov_len = sizeof(scno);
+	EXPECT_EQ(0, ptrace(PTRACE_GETREGSET, tracee, NT_ARM_SYSTEM_CALL,
+			    &iov)) {
+		TH_LOG("PTRACE_GETREGSET NT_ARM_SYSTEM_CALL failed");
+		return -1;
+	}
+
+	//TH_LOG("NT_ARM_SYSTEM_CALL:%d", scno);
+	return scno;
+#endif
 
 	iov.iov_base = &regs;
 	iov.iov_len = sizeof(regs);
 	EXPECT_EQ(0, ptrace(PTRACE_GETREGSET, tracee, NT_PRSTATUS, &iov)) {
-		TH_LOG("PTRACE_GETREGSET failed");
+		TH_LOG("PTRACE_GETREGSET NT_PRSTATUS failed");
 		return -1;
 	}
 
-	return regs.SYSCALL_NUM;
+	scno = regs.SYSCALL_NUM;
+	//TH_LOG("NT_PRSTATUS:%d", scno);
+
+	return scno;
 }
 
 /* Architecture-specific syscall changing routine. */
@@ -1092,12 +1117,31 @@ void change_syscall(struct __test_metadata *_metadata,
 	int ret;
 	ARCH_REGS regs;
 
+#if defined(__aarch64__)
+	/*
+	 * aarch64 must update syscall before fetching NT_PRSTATUS, which
+	 * may overwrite the results.
+	 */
+	{
+		iov.iov_base = &syscall;
+		iov.iov_len = sizeof(syscall);
+		EXPECT_EQ(0, ptrace(PTRACE_SETREGSET, tracee,
+				    NT_ARM_SYSTEM_CALL, &iov)) {
+			TH_LOG("PTRACE_SETREGSET NT_ARM_SYSTEM_CALL failed");
+		}
+	}
+#endif
+
+	/*
+	 * Fetch general registers for updating at least the syscall return
+	 * value, and possibly also the syscall number.
+	 */
 	iov.iov_base = &regs;
 	iov.iov_len = sizeof(regs);
 	ret = ptrace(PTRACE_GETREGSET, tracee, NT_PRSTATUS, &iov);
 	EXPECT_EQ(0, ret);
 
-#if defined(__x86_64__) || defined(__i386__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(__i386__)
 	{
 		regs.SYSCALL_NUM = syscall;
 	}
@@ -1111,7 +1155,7 @@ void change_syscall(struct __test_metadata *_metadata,
 		EXPECT_EQ(0, ret);
 	}
 
-#else
+#elif !defined(__aarch64__)
 	ASSERT_EQ(1, 0) {
 		TH_LOG("How is the syscall changed on this architecture?");
 	}
@@ -1911,10 +1955,15 @@ TEST(syscall_restart) {
 	ASSERT_EQ(SIGTRAP, WSTOPSIG(status));
 	ASSERT_EQ(PTRACE_EVENT_SECCOMP, (status >> 16));
 	ASSERT_EQ(0, ptrace(PTRACE_GETEVENTMSG, child_pid, NULL, &msg));
-	ASSERT_EQ(0x200, msg);
+	/* FIXME:
+	 * - native ARM does not expose true syscall.
+	 * - compat ARM on ARM64 does expose true syscall.
+	 * - native ARM64 hides true syscall even from seccomp.
+	 */
+	EXPECT_EQ(0x200, msg); /* this will fail on native aarch64. */
 	ret = get_syscall(_metadata, child_pid);
 #if defined(__arm__)
-	/* FIXME: ARM does not expose true syscall in registers. */
+	/* this will fail on aarch64 in compat mode. */
 	EXPECT_EQ(__NR_poll, ret);
 #else
 	EXPECT_EQ(__NR_restart_syscall, ret);
